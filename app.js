@@ -7,7 +7,7 @@ const PROMPT = "قم بتحليل هذه الصورة واستخراج البي�
   + KEYS.join(", ") + ". انقل كل قيمة كما هي مكتوبة في الصورة مع وحدتها، وإذا لم تجد قيمة اجعلها \"-\".";
 
 /* ---------- image -> base64 (downscaled for fast upload) ---------- */
-async function imageToBase64(file, maxSide = 1800) {
+async function imageToBase64(file, maxSide = 1400) {
   const bmp = await createImageBitmap(file);
   const scale = Math.min(1, maxSide / Math.max(bmp.width, bmp.height));
   const c = document.createElement("canvas");
@@ -32,14 +32,27 @@ async function extractData(file, apiKey) {
     contents: [{ parts: [{ text: PROMPT }, { inline_data: { mime_type: "image/jpeg", data: b64 } }] }],
     generationConfig: { temperature: 0, responseMimeType: "application/json" }
   };
+  const bodyFor = m => {
+    const b = JSON.parse(JSON.stringify(body));
+    if (m.includes("2.5")) b.generationConfig.thinkingConfig = { thinkingBudget: 0 }; // faster
+    return b;
+  };
   let lastErr = "";
   for (const m of MODELS) {
     let r;
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), 45000); // 45s timeout
     try {
       r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent?key=${encodeURIComponent(apiKey)}`,
-        { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-    } catch (e) { throw new Error("مفيش اتصال بالإنترنت أو الطلب اتحجب"); }
+        { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(bodyFor(m)), signal: ctl.signal });
+    } catch (e) {
+      clearTimeout(timer);
+      if (e.name === "AbortError") throw new Error("الطلب أخد أكتر من 45 ثانية. اتأكد من النت وجرّب تاني");
+      throw new Error("مفيش اتصال بجوجل. اتأكد من النت (جرّب تقفل VPN لو شغال)");
+    }
+    clearTimeout(timer);
     if (r.status === 404) { lastErr = m + " غير متاح"; continue; }
+    if (r.status === 429) throw new Error("خلصت الحد المجاني مؤقتاً. استنى دقيقة وجرّب تاني");
     const j = await r.json();
     if (!r.ok) throw new Error((j.error && j.error.message) || ("HTTP " + r.status));
     const t = j.candidates?.[0]?.content?.parts?.[0]?.text;

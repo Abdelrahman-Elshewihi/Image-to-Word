@@ -71,8 +71,10 @@ $("go").onclick = async () => {
   localStorage.setItem("gk", key);
   $("go").disabled = true; $("bar").style.display = "block"; $("out").style.display = "none";
   try{
-    st("بحلل الصورة بالذكاء الاصطناعي…", "var(--cyan)");
-    const data = await extractData(file, key);
+    const t0 = Date.now();
+    const tick = setInterval(() => st("بحلل الصورة بالذكاء الاصطناعي… " + Math.round((Date.now()-t0)/1000) + " ث", "var(--cyan)"), 500);
+    let data;
+    try { data = await extractData(file, key); } finally { clearInterval(tick); }
     st("بجهز ملف الوورد…", "var(--cyan)");
     blob = await makeDocxBlob(data);
     fname = "thermal_report_" + new Date().toISOString().slice(0,16).replace(/[:T]/g,"-") + ".docx";
