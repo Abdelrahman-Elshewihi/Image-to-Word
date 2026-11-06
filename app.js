@@ -38,8 +38,9 @@ function parseJson(text) {
   return out;
 }
 
-const MODEL_ORDER = ["gemini-2.5-flash", "gemini-flash-latest", "gemini-2.0-flash"];
-const ENDPOINT = (m, k) => `https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent?key=${encodeURIComponent(k)}`;
+const API = "https://generativelanguage.googleapis.com/v1beta";
+const ENDPOINT = (m, k) => `${API}/models/${m}:generateContent?key=${encodeURIComponent(k)}`;
+const ver = n => { const x = n.match(/gemini-(\d+(?:\.\d+)?)/); return x ? parseFloat(x[1]) : 0; };
 
 async function timedFetch(url, opts, ms) {
   const ctl = new AbortController();
@@ -48,71 +49,95 @@ async function timedFetch(url, opts, ms) {
   finally { clearTimeout(timer); }
 }
 
-function reqBody(model, parts, json) {
+/* ask Google which flash models this key can actually use (newest first) */
+async function candidateModels(apiKey) {
+  let names = [];
+  try {
+    const r = await timedFetch(`${API}/models?pageSize=1000&key=${encodeURIComponent(apiKey)}`, {}, 15000);
+    const j = await r.json();
+    names = (j.models || [])
+      .filter(m => (m.supportedGenerationMethods || []).includes("generateContent"))
+      .map(m => m.name.replace("models/", ""))
+      .filter(n => /^gemini-/.test(n) && /flash/.test(n) &&
+        !/(tts|image|live|audio|embedding|robotics|computer|native|thinking|exp|vision)/.test(n));
+  } catch (e) {}
+  names.sort((a, b) => ver(b) - ver(a) || (/lite/.test(a) - /lite/.test(b)) || (/preview/.test(a) - /preview/.test(b)));
+  let saved = null; try { saved = localStorage.getItem("gm"); } catch (e) {}
+  if (saved && names.includes(saved)) names = [saved, ...names.filter(n => n !== saved)];
+  if (!names.length) names = ["gemini-flash-latest", "gemini-2.5-flash"];
+  return names.slice(0, 5);
+}
+
+function thinkingFor(m) {
+  if (/gemini-2\.5/.test(m)) return { thinkingBudget: 0 };
+  if (ver(m) >= 3 || /latest/.test(m)) return { thinkingLevel: "minimal" };
+  return null;
+}
+function reqBody(model, parts, json, noThink) {
   const b = { contents: [{ parts }], generationConfig: { temperature: 0 } };
   if (json) b.generationConfig.responseMimeType = "application/json";
-  if (model.includes("2.5")) b.generationConfig.thinkingConfig = { thinkingBudget: 0 };
+  const t = noThink ? null : thinkingFor(model);
+  if (t) b.generationConfig.thinkingConfig = t;
   return JSON.stringify(b);
+}
+async function post(m, apiKey, parts, json, ms) {
+  const send = noThink => timedFetch(ENDPOINT(m, apiKey),
+    { method: "POST", headers: { "Content-Type": "application/json" }, body: reqBody(m, parts, json, noThink) }, ms);
+  let r = await send(false);
+  if (r.status === 400) r = await send(true); // model may not accept thinking settings
+  return r;
 }
 
 async function extractData(file, apiKey, onStatus) {
   const say = onStatus || (() => {});
   say("بجهز الصورة…");
   const b64 = await imageToBase64(file);
+  const kb = Math.round(b64.length * 0.75 / 1024);
   const parts = [{ text: PROMPT }, { inline_data: { mime_type: "image/jpeg", data: b64 } }];
+  say("بدوّر على الموديل المتاح…");
+  const models = await candidateModels(apiKey);
   const tried = [];
-  for (const m of MODEL_ORDER) {
-    say(`بحلل بموديل ${m} (حجم الصورة ${Math.round(b64.length * 0.75 / 1024)} KB)…`);
+  for (const m of models) {
+    say(`بحلل بموديل ${m} (${kb} KB)…`);
     let r;
-    try {
-      r = await timedFetch(ENDPOINT(m, apiKey),
-        { method: "POST", headers: { "Content-Type": "application/json" }, body: reqBody(m, parts, true) }, 30000);
-    } catch (e) {
-      tried.push(m + (e.name === "AbortError" ? ": اتأخر أكتر من 30 ثانية" : ": فشل الاتصال (" + e.message + ")"));
-      continue; // try next model
-    }
-    if (r.status === 404) { tried.push(m + ": غير متاح"); continue; }
-    let j = {};
-    try { j = await r.json(); } catch (e) {}
+    try { r = await post(m, apiKey, parts, true, 45000); }
+    catch (e) { tried.push(`${m}: ${e.name === "AbortError" ? "اتأخر" : "فشل اتصال"}`); continue; }
+    let j = {}; try { j = await r.json(); } catch (e) {}
     if (r.status === 429) throw new Error("خلصت الحد المجاني مؤقتاً. استنى دقيقة وجرّب تاني");
-    if (r.status === 503) { tried.push(m + ": الموديل مشغول"); continue; }
-    if (!r.ok) throw new Error((j.error && j.error.message) || ("HTTP " + r.status));
+    if (!r.ok) { tried.push(`${m}: ${r.status} ${(j.error && j.error.message || "").slice(0, 60)}`); continue; }
     const t = j.candidates?.[0]?.content?.parts?.[0]?.text;
-    if (!t) { tried.push(m + ": رد فاضي"); continue; }
+    if (!t) { tried.push(`${m}: رد فاضي`); continue; }
+    try { localStorage.setItem("gm", m); } catch (e) {}
     return parseJson(t);
   }
-  throw new Error("كل المحاولات فشلت: " + tried.join(" | "));
+  throw new Error("كل الموديلات فشلت → " + tried.join(" | "));
 }
 
-/* ---------- diagnostics: measures each stage ---------- */
+/* ---------- diagnostics ---------- */
 async function diagnose(apiKey, file, log) {
   const ms = t0 => Math.round(performance.now() - t0) + " ms";
   let t = performance.now();
-  try {
-    const r = await timedFetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(apiKey)}`, {}, 15000);
-    log(`1) اتصال + مفتاح: ${r.status} (${ms(t)})`);
-  } catch (e) { log("1) اتصال: فشل - " + e.message); return; }
-
-  for (const m of MODEL_ORDER.slice(0, 2)) {
+  const models = await candidateModels(apiKey);
+  log(`1) الموديلات المتاحة (${ms(t)}): ${models.join(", ")}`);
+  for (const m of models.slice(0, 3)) {
     t = performance.now();
     try {
-      const r = await timedFetch(ENDPOINT(m, apiKey),
-        { method: "POST", headers: { "Content-Type": "application/json" }, body: reqBody(m, [{ text: "say hi" }], false) }, 30000);
-      log(`2) طلب نص بسيط (${m}): ${r.status} (${ms(t)})`);
-    } catch (e) { log(`2) طلب نص (${m}): ${e.name === "AbortError" ? "اتأخر +30 ثانية" : e.message}`); }
+      const r = await post(m, apiKey, [{ text: "say hi" }], false, 30000);
+      log(`2) نص بسيط ${m}: ${r.status} (${ms(t)})`);
+    } catch (e) { log(`2) نص بسيط ${m}: ${e.name === "AbortError" ? "اتأخر +30 ثانية" : e.message}`); }
   }
   if (!file) { log("3) اختار صورة عشان أفحص رفعها"); return; }
   t = performance.now();
   let b64;
   try { b64 = await imageToBase64(file); } catch (e) { log("3) تجهيز الصورة فشل: " + e.message); return; }
   log(`3) تجهيز الصورة: ${Math.round(b64.length * 0.75 / 1024)} KB (${ms(t)})`);
-  t = performance.now();
-  try {
-    const r = await timedFetch(ENDPOINT(MODEL_ORDER[0], apiKey),
-      { method: "POST", headers: { "Content-Type": "application/json" },
-        body: reqBody(MODEL_ORDER[0], [{ text: "say hi" }, { inline_data: { mime_type: "image/jpeg", data: b64 } }], false) }, 30000);
-    log(`4) رفع الصورة + رد: ${r.status} (${ms(t)})`);
-  } catch (e) { log("4) رفع الصورة: " + (e.name === "AbortError" ? "اتأخر +30 ثانية (رفع الصورة بطيء)" : e.message)); }
+  for (const m of models.slice(0, 2)) {
+    t = performance.now();
+    try {
+      const r = await post(m, apiKey, [{ text: "say hi" }, { inline_data: { mime_type: "image/jpeg", data: b64 } }], false, 30000);
+      log(`4) صورة ${m}: ${r.status} (${ms(t)})`);
+    } catch (e) { log(`4) صورة ${m}: ${e.name === "AbortError" ? "اتأخر +30 ثانية" : e.message}`); }
+  }
 }
 
 /* ---------- Word (80mm thermal): clean tables, monochrome-friendly ---------- */
