@@ -1,10 +1,21 @@
-/* app.js - Gemini extraction + 80mm thermal Word generation (runs fully in the browser) */
-const MODELS = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-flash-latest"];
-const KEYS = ["date","name","age","gender","height","weight","bmi","bfr","muscle_rate","fat_mass",
-  "body_water","protein_mass","bone_mass","body_type","bmr","visceral_fat","subcutaneous_fat",
-  "physical_age","obesity_level","protein_rate"];
-const PROMPT = "قم بتحليل هذه الصورة واستخراج البيانات الطبية. أرجع النتيجة بصيغة JSON فقط، بدون أي نصوص أو تنسيقات Markdown إضافية. استخدم هذه المفاتيح بالضبط: "
-  + KEYS.join(", ") + ". انقل كل قيمة كما هي مكتوبة في الصورة مع وحدتها، وإذا لم تجد قيمة اجعلها \"-\".";
+/* app.js - LeaOne body-composition report image -> Gemini -> clean 80mm thermal Word file */
+const KEYS = ["date","name","age","gender","height",
+  "weight","weight_change","bmi","bmi_status","bfr","bfr_status","muscle_rate","muscle_rate_status",
+  "fat_mass","fat_mass_status","body_water","body_water_status","protein_mass","protein_mass_status","bone_mass","bone_mass_status",
+  "standard_weight","muscle_mass","lean_body_mass","weight_control","obesity_index","body_type",
+  "bmr","bmr_ref","visceral_fat","visceral_fat_ref","subcutaneous_fat","subcutaneous_fat_ref",
+  "physical_age","physical_age_ref","obesity_level","obesity_level_ref","protein_rate","protein_rate_ref"];
+
+const PROMPT = `هذه صورة تقرير "تحليل تكوين الجسم" من تطبيق LeaOne. استخرج البيانات وأرجع النتيجة بصيغة JSON فقط، بدون أي نصوص أو تنسيقات Markdown إضافية، وبهذه المفاتيح بالضبط:
+date: التاريخ والوقت أعلى التقرير.
+name: الاسم، age: العمر (رقم)، gender: الجنس، height: الارتفاع مع الوحدة.
+weight: الوزن الكبير في قسم البيانات الأساسية مع kg. weight_change: التغير مقارنة بالقياس الأخير مع الإشارة (+ للزيادة و - للنقصان) مع kg.
+bmi: مؤشر كتلة الجسم و bmi_status: تقييمه (مثل رفيع/معيار). bfr: نسبة الدهون و bfr_status: تقييمها. muscle_rate: معدل العضلات % و muscle_rate_status: تقييمه.
+fat_mass: كتلة الدهون و fat_mass_status تقييمها. body_water: ماء الجسم و body_water_status. protein_mass: كتلة البروتين و protein_mass_status. bone_mass: كتلة العظام و bone_mass_status.
+من قسم "التحكم في الوزن": standard_weight: الوزن القياسي، muscle_mass: كتلة العضلات، lean_body_mass: كتلة الجسم النحيل، weight_control: التحكم في الوزن (مع الإشارة)، obesity_index: مؤشر السمنة.
+body_type: نوع الجسم (النص الكبير في قسم نوع الجسم).
+من قسم "مؤشرات أخرى" القيمة ثم المرجعي: bmr و bmr_ref (معدل الأيض الأساسي مع kcal)، visceral_fat و visceral_fat_ref (مؤشر الدهون الحشوية)، subcutaneous_fat و subcutaneous_fat_ref (الدهون تحت الجلد)، physical_age و physical_age_ref (العمر الجسدي)، obesity_level و obesity_level_ref (مستوى السمنة)، protein_rate و protein_rate_ref (معدل البروتين).
+انقل كل قيمة كما هي مكتوبة في الصورة مع وحدتها، وإذا لم تجد قيمة اجعلها "-".`;
 
 /* ---------- image -> base64 (downscaled for fast upload) ---------- */
 async function imageToBase64(file, maxSide = 1400) {
@@ -23,93 +34,192 @@ function parseJson(text) {
   if (Array.isArray(d)) d = d[0] || {};
   const out = {};
   KEYS.forEach(k => { const v = d[k]; out[k] = (v === null || v === undefined || v === "") ? "-" : String(v); });
+  out.name = out.name.replace(/[.\u2026]+$/, "").trim() || "-";
   return out;
 }
 
-async function extractData(file, apiKey) {
-  const b64 = await imageToBase64(file);
-  const body = {
-    contents: [{ parts: [{ text: PROMPT }, { inline_data: { mime_type: "image/jpeg", data: b64 } }] }],
-    generationConfig: { temperature: 0, responseMimeType: "application/json" }
-  };
-  const bodyFor = m => {
-    const b = JSON.parse(JSON.stringify(body));
-    if (m.includes("2.5")) b.generationConfig.thinkingConfig = { thinkingBudget: 0 }; // faster
-    return b;
-  };
-  let lastErr = "";
-  for (const m of MODELS) {
-    let r;
-    const ctl = new AbortController();
-    const timer = setTimeout(() => ctl.abort(), 45000); // 45s timeout
-    try {
-      r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent?key=${encodeURIComponent(apiKey)}`,
-        { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(bodyFor(m)), signal: ctl.signal });
-    } catch (e) {
-      clearTimeout(timer);
-      if (e.name === "AbortError") throw new Error("الطلب أخد أكتر من 45 ثانية. اتأكد من النت وجرّب تاني");
-      throw new Error("مفيش اتصال بجوجل. اتأكد من النت (جرّب تقفل VPN لو شغال)");
-    }
-    clearTimeout(timer);
-    if (r.status === 404) { lastErr = m + " غير متاح"; continue; }
-    if (r.status === 429) throw new Error("خلصت الحد المجاني مؤقتاً. استنى دقيقة وجرّب تاني");
-    const j = await r.json();
-    if (!r.ok) throw new Error((j.error && j.error.message) || ("HTTP " + r.status));
-    const t = j.candidates?.[0]?.content?.parts?.[0]?.text;
-    if (!t) throw new Error("الرد جه فاضي، جرّب صورة أوضح");
-    return parseJson(t);
-  }
-  throw new Error("مفيش موديل متاح. " + lastErr);
+const MODEL_ORDER = ["gemini-2.5-flash", "gemini-flash-latest", "gemini-2.0-flash"];
+const ENDPOINT = (m, k) => `https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent?key=${encodeURIComponent(k)}`;
+
+async function timedFetch(url, opts, ms) {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), ms);
+  try { return await fetch(url, { ...opts, signal: ctl.signal }); }
+  finally { clearTimeout(timer); }
 }
 
-/* ---------- Word (80mm thermal) ---------- */
-const SEP = "-".repeat(60);
+function reqBody(model, parts, json) {
+  const b = { contents: [{ parts }], generationConfig: { temperature: 0 } };
+  if (json) b.generationConfig.responseMimeType = "application/json";
+  if (model.includes("2.5")) b.generationConfig.thinkingConfig = { thinkingBudget: 0 };
+  return JSON.stringify(b);
+}
+
+async function extractData(file, apiKey, onStatus) {
+  const say = onStatus || (() => {});
+  say("بجهز الصورة…");
+  const b64 = await imageToBase64(file);
+  const parts = [{ text: PROMPT }, { inline_data: { mime_type: "image/jpeg", data: b64 } }];
+  const tried = [];
+  for (const m of MODEL_ORDER) {
+    say(`بحلل بموديل ${m} (حجم الصورة ${Math.round(b64.length * 0.75 / 1024)} KB)…`);
+    let r;
+    try {
+      r = await timedFetch(ENDPOINT(m, apiKey),
+        { method: "POST", headers: { "Content-Type": "application/json" }, body: reqBody(m, parts, true) }, 30000);
+    } catch (e) {
+      tried.push(m + (e.name === "AbortError" ? ": اتأخر أكتر من 30 ثانية" : ": فشل الاتصال (" + e.message + ")"));
+      continue; // try next model
+    }
+    if (r.status === 404) { tried.push(m + ": غير متاح"); continue; }
+    let j = {};
+    try { j = await r.json(); } catch (e) {}
+    if (r.status === 429) throw new Error("خلصت الحد المجاني مؤقتاً. استنى دقيقة وجرّب تاني");
+    if (r.status === 503) { tried.push(m + ": الموديل مشغول"); continue; }
+    if (!r.ok) throw new Error((j.error && j.error.message) || ("HTTP " + r.status));
+    const t = j.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!t) { tried.push(m + ": رد فاضي"); continue; }
+    return parseJson(t);
+  }
+  throw new Error("كل المحاولات فشلت: " + tried.join(" | "));
+}
+
+/* ---------- diagnostics: measures each stage ---------- */
+async function diagnose(apiKey, file, log) {
+  const ms = t0 => Math.round(performance.now() - t0) + " ms";
+  let t = performance.now();
+  try {
+    const r = await timedFetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(apiKey)}`, {}, 15000);
+    log(`1) اتصال + مفتاح: ${r.status} (${ms(t)})`);
+  } catch (e) { log("1) اتصال: فشل - " + e.message); return; }
+
+  for (const m of MODEL_ORDER.slice(0, 2)) {
+    t = performance.now();
+    try {
+      const r = await timedFetch(ENDPOINT(m, apiKey),
+        { method: "POST", headers: { "Content-Type": "application/json" }, body: reqBody(m, [{ text: "say hi" }], false) }, 30000);
+      log(`2) طلب نص بسيط (${m}): ${r.status} (${ms(t)})`);
+    } catch (e) { log(`2) طلب نص (${m}): ${e.name === "AbortError" ? "اتأخر +30 ثانية" : e.message}`); }
+  }
+  if (!file) { log("3) اختار صورة عشان أفحص رفعها"); return; }
+  t = performance.now();
+  let b64;
+  try { b64 = await imageToBase64(file); } catch (e) { log("3) تجهيز الصورة فشل: " + e.message); return; }
+  log(`3) تجهيز الصورة: ${Math.round(b64.length * 0.75 / 1024)} KB (${ms(t)})`);
+  t = performance.now();
+  try {
+    const r = await timedFetch(ENDPOINT(MODEL_ORDER[0], apiKey),
+      { method: "POST", headers: { "Content-Type": "application/json" },
+        body: reqBody(MODEL_ORDER[0], [{ text: "say hi" }, { inline_data: { mime_type: "image/jpeg", data: b64 } }], false) }, 30000);
+    log(`4) رفع الصورة + رد: ${r.status} (${ms(t)})`);
+  } catch (e) { log("4) رفع الصورة: " + (e.name === "AbortError" ? "اتأخر +30 ثانية (رفع الصورة بطيء)" : e.message)); }
+}
+
+/* ---------- Word (80mm thermal): clean tables, monochrome-friendly ---------- */
 const FONT = "Arial";
 const LRE = "\u202a", PDF = "\u202c";
+const COLS = [1650, 1200, 1230]; // = 4080 DXA = 7.2cm (8cm - 2 x 0.4cm margins)
 
 function buildDoc(d, D) {
-  const { Document, Paragraph, TextRun, AlignmentType } = D;
-  const par = (text, size, bold, align) => new Paragraph({
-    bidirectional: true,
-    // in a bidi paragraph, jc "left" = start edge = visual RIGHT
-    alignment: align === "center" ? AlignmentType.CENTER : AlignmentType.LEFT,
-    spacing: { before: 0, after: 40 },
-    children: [new TextRun({ text, font: { ascii: FONT, hAnsi: FONT, cs: FONT, eastAsia: FONT },
-      size: size * 2, sizeComplexScript: size * 2, bold, boldComplexScript: bold, rightToLeft: true })]
-  });
-  const sep = () => par(SEP, 9, false, "center");
-  const line = (label, key) => par(`${label}: ${LRE}${d[key]}${PDF}`, 9, false, "right");
-  const head = t => par(t, 10, true, "right");
-  const rows = (arr) => arr.map(([l, k]) => line(l, k));
+  const { Document, Paragraph, TextRun, AlignmentType, Table, TableRow, TableCell, WidthType, BorderStyle } = D;
+  const NONE = { style: BorderStyle.NONE, size: 0, color: "FFFFFF" };
+  const fontObj = { ascii: FONT, hAnsi: FONT, cs: FONT, eastAsia: FONT };
 
+  const run = (text, size, bold) => new TextRun({ text, font: fontObj, size: size * 2,
+    sizeComplexScript: size * 2, bold, boldComplexScript: bold, rightToLeft: true });
+  // bidi paragraph: jc "left" = start edge = visual RIGHT
+  const par = (text, size, bold, align, extra = {}) => new Paragraph({
+    bidirectional: true,
+    alignment: align === "center" ? AlignmentType.CENTER : AlignmentType.LEFT,
+    spacing: { before: 0, after: 20 }, ...extra,
+    children: [run(text, size, bold)]
+  });
+  const val = v => `${LRE}${v}${PDF}`;
+
+  const cell = (text, w, size, bold, align, span) => new TableCell({
+    width: { size: w, type: WidthType.DXA }, columnSpan: span,
+    margins: { top: 25, bottom: 25, left: 40, right: 40 },
+    borders: { top: NONE, left: NONE, right: NONE, bottom: NONE },
+    children: [par(text, size, bold, align, { spacing: { before: 0, after: 0 } })]
+  });
+  const row = (a, b, c, o = {}) => new TableRow({ cantSplit: true, children: c === undefined
+    ? [cell(a, COLS[0], 9, false, "right"), cell(b, COLS[1] + COLS[2], 9, true, "center", 2)]
+    : [cell(a, COLS[0], o.h ? 8 : 9, !!o.h, "right"), cell(b, COLS[1], o.h ? 8 : 9, !o.h, "center"), cell(c, COLS[2], o.h ? 8 : 9, !!o.h, "center")] });
+
+  const table = rows => new Table({
+    width: { size: 4080, type: WidthType.DXA }, columnWidths: COLS, visuallyRightToLeft: true,
+    borders: { top: NONE, bottom: NONE, left: NONE, right: NONE, insideVertical: NONE,
+      insideHorizontal: { style: BorderStyle.DOTTED, size: 6, color: "000000" } },
+    rows
+  });
+  const section = t => par(t, 10, true, "right", {
+    spacing: { before: 140, after: 40 },
+    border: { bottom: { style: BorderStyle.SINGLE, size: 8, color: "000000", space: 1 } }
+  });
+
+  const status = (l, k, s) => row(l, val(d[k]), d[s]);
+  const ref = (l, k, r) => row(l, val(d[k]), val(d[r]));
   const dateText = d.date !== "-" ? d.date : new Date().toLocaleString("en-GB");
+
   const children = [
-    par("تقرير تحليل تكوين الجسم", 12, true, "center"),
-    par(dateText, 8, false, "center"),
-    sep(), head("البيانات الأساسية"),
-    ...rows([["الاسم","name"],["العمر","age"],["النوع","gender"],["الطول","height"],["الوزن","weight"]]),
-    sep(), head("تحليل تكوين الجسم"),
-    ...rows([["مؤشر كتلة الجسم","bmi"],["نسبة الدهون","bfr"],["نسبة العضلات","muscle_rate"],
-      ["كتلة الدهون","fat_mass"],["ماء الجسم","body_water"],["كتلة البروتين","protein_mass"],
-      ["كتلة العظام","bone_mass"],["نسبة البروتين","protein_rate"]]),
-    sep(), head("مؤشرات إضافية"),
-    ...rows([["نوع الجسم","body_type"],["معدل الحرق","bmr"],["الدهون الحشوية","visceral_fat"],
-      ["الدهون تحت الجلد","subcutaneous_fat"],["العمر البدني","physical_age"],["مستوى السمنة","obesity_level"]]),
-    sep()
+    par("تقرير تحليل تكوين الجسم", 12, true, "center", { spacing: { before: 0, after: 40 } }),
+    par(val(dateText), 8, false, "center", { spacing: { before: 0, after: 60 } }),
+    table([
+      row("الاسم", d.name), row("العمر", val(d.age)), row("الجنس", d.gender), row("الطول", val(d.height))
+    ]),
+
+    section("الوزن والمؤشرات الأساسية"),
+    table([
+      row("المؤشر", "القياس", "التقييم", { h: true }),
+      row("الوزن", val(d.weight), ""),
+      row("التغير عن آخر قياس", val(d.weight_change), ""),
+      status("مؤشر كتلة الجسم", "bmi", "bmi_status"),
+      status("نسبة الدهون", "bfr", "bfr_status"),
+      status("معدل العضلات", "muscle_rate", "muscle_rate_status")
+    ]),
+
+    section("تحليل تكوين الجسم"),
+    table([
+      row("المؤشر", "القياس", "التقييم", { h: true }),
+      status("كتلة الدهون", "fat_mass", "fat_mass_status"),
+      status("ماء الجسم", "body_water", "body_water_status"),
+      status("كتلة البروتين", "protein_mass", "protein_mass_status"),
+      status("كتلة العظام", "bone_mass", "bone_mass_status")
+    ]),
+
+    section("التحكم في الوزن"),
+    table([
+      row("الوزن القياسي", val(d.standard_weight)),
+      row("كتلة العضلات", val(d.muscle_mass)),
+      row("كتلة الجسم النحيل", val(d.lean_body_mass)),
+      row("التحكم في الوزن", val(d.weight_control)),
+      row("مؤشر السمنة", val(d.obesity_index))
+    ]),
+
+    section("نوع الجسم"),
+    par(d.body_type, 11, true, "center", { spacing: { before: 40, after: 20 } }),
+
+    section("مؤشرات أخرى"),
+    table([
+      row("المؤشر", "القياس", "المرجعي", { h: true }),
+      ref("معدل الأيض الأساسي", "bmr", "bmr_ref"),
+      ref("مؤشر الدهون الحشوية", "visceral_fat", "visceral_fat_ref"),
+      ref("الدهون تحت الجلد", "subcutaneous_fat", "subcutaneous_fat_ref"),
+      ref("العمر الجسدي", "physical_age", "physical_age_ref"),
+      ref("مستوى السمنة", "obesity_level", "obesity_level_ref"),
+      ref("معدل البروتين", "protein_rate", "protein_rate_ref")
+    ])
   ];
   return new Document({
     styles: { default: { document: { run: { font: FONT, size: 18 } } } },
     sections: [{
       properties: { page: {
-        size: { width: 4535, height: 16838 },               // 8.0 x 29.7 cm
-        margin: { top: 227, right: 227, bottom: 227, left: 227 } // 0.4 cm
-      } },
+        size: { width: 4535, height: 16838 },                      // 8.0 x 29.7 cm
+        margin: { top: 227, right: 227, bottom: 227, left: 227 } } },  // 0.4 cm
       children
     }]
   });
 }
 
-async function makeDocxBlob(d) {
-  return await docx.Packer.toBlob(buildDoc(d, docx));
-}
-if (typeof module !== "undefined") module.exports = { buildDoc, parseJson };
+async function makeDocxBlob(d) { return await docx.Packer.toBlob(buildDoc(d, docx)); }
+if (typeof module !== "undefined") module.exports = { buildDoc, parseJson, KEYS };

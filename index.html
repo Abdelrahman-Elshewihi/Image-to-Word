@@ -40,6 +40,8 @@ button{border:0;border-radius:14px;padding:16px;font-size:17px;font-weight:700;c
   <button id="go">Generate Report</button>
   <div id="bar"><i></i></div>
   <div id="st"></div>
+  <button id="diag" class="ghost" style="padding:12px;font-size:14px">فحص الاتصال</button>
+  <pre id="dg" style="display:none;direction:ltr;white-space:pre-wrap;font-size:12px;color:var(--mute);background:var(--panel);padding:12px;border-radius:12px;margin:0"></pre>
   <div id="out" class="row">
     <button id="share" class="ghost">مشاركة / فتح</button>
     <button id="dl" class="ghost">تحميل</button>
@@ -71,10 +73,10 @@ $("go").onclick = async () => {
   localStorage.setItem("gk", key);
   $("go").disabled = true; $("bar").style.display = "block"; $("out").style.display = "none";
   try{
-    const t0 = Date.now();
-    const tick = setInterval(() => st("بحلل الصورة بالذكاء الاصطناعي… " + Math.round((Date.now()-t0)/1000) + " ث", "var(--cyan)"), 500);
+    const t0 = Date.now(); let msg = "بجهز الصورة…";
+    const tick = setInterval(() => st(msg + " " + Math.round((Date.now()-t0)/1000) + " ث", "var(--cyan)"), 500);
     let data;
-    try { data = await extractData(file, key); } finally { clearInterval(tick); }
+    try { data = await extractData(file, key, m => { msg = m; }); } finally { clearInterval(tick); }
     st("بجهز ملف الوورد…", "var(--cyan)");
     blob = await makeDocxBlob(data);
     fname = "thermal_report_" + new Date().toISOString().slice(0,16).replace(/[:T]/g,"-") + ".docx";
@@ -92,6 +94,13 @@ $("share").onclick = async () => {
     try{ await navigator.share({files:[f], title: fname}); return; }catch(e){ if(e.name==="AbortError") return; }
   }
   $("dl").click();
+};
+$("diag").onclick = async () => {
+  const key = $("key").value.trim(); if(!key) return st("حط المفتاح الأول", "var(--err)");
+  const dg = $("dg"); dg.style.display = "block"; dg.textContent = "بفحص…\n";
+  $("diag").disabled = true;
+  await diagnose(key, file, line => { dg.textContent += line + "\n"; });
+  dg.textContent += "خلصت."; $("diag").disabled = false;
 };
 if("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js");
 </script>
