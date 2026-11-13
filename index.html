@@ -51,7 +51,54 @@ button{border:0;border-radius:14px;padding:16px;font-size:17px;font-weight:700;c
 <script src="app.js"></script>
 <script>
 const $ = id => document.getElementById(id);
-let file = null, blob = null, fname = "thermal_report.docx";
+let file = null, blob = null, fname = "report.docx";
+const FOLDER_NAME = "SB In Body";
+const DB_NAME = "thermal-report-storage";
+const STORE_NAME = "handles";
+
+function openHandleDB(){
+  return new Promise((resolve,reject)=>{
+    const req = indexedDB.open(DB_NAME, 1);
+    req.onupgradeneeded = () => req.result.createObjectStore(STORE_NAME);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+async function getSavedDirectory(){
+  const db = await openHandleDB();
+  return new Promise((resolve,reject)=>{
+    const tx = db.transaction(STORE_NAME,"readonly");
+    const req = tx.objectStore(STORE_NAME).get("reportDirectory");
+    req.onsuccess = () => resolve(req.result || null);
+    req.onerror = () => reject(req.error);
+  });
+}
+async function saveDirectory(handle){
+  const db = await openHandleDB();
+  return new Promise((resolve,reject)=>{
+    const tx = db.transaction(STORE_NAME,"readwrite");
+    tx.objectStore(STORE_NAME).put(handle,"reportDirectory");
+    tx.oncomplete = resolve;
+    tx.onerror = () => reject(tx.error);
+  });
+}
+function reportFileName(){
+  const d = new Date();
+  const pad = n => String(n).padStart(2,"0");
+  return `${pad(d.getDate())}-${pad(d.getMonth()+1)}-${d.getFullYear()}_${pad(d.getHours())}-${pad(d.getMinutes())}.docx`;
+}
+async function getReportDirectory(){
+  let parent = await getSavedDirectory();
+  if(parent){
+    let permission = await parent.queryPermission({mode:"readwrite"});
+    if(permission !== "granted") permission = await parent.requestPermission({mode:"readwrite"});
+    if(permission === "granted") return parent.getDirectoryHandle(FOLDER_NAME,{create:true});
+  }
+  if(!window.showDirectoryPicker) return null;
+  parent = await window.showDirectoryPicker({mode:"readwrite"});
+  await saveDirectory(parent);
+  return parent.getDirectoryHandle(FOLDER_NAME,{create:true});
+}
 $("key").value = localStorage.getItem("gk") || "";
 const st = (t, c) => { $("st").textContent = t; $("st").style.color = c || "var(--mute)"; };
 function setFile(f){
@@ -79,14 +126,34 @@ $("go").onclick = async () => {
     try { data = await extractData(file, key, m => { msg = m; }); } finally { clearInterval(tick); }
     st("بجهز ملف الوورد…", "var(--cyan)");
     blob = await makeDocxBlob(data);
-    fname = "thermal_report_" + new Date().toISOString().slice(0,16).replace(/[:T]/g,"-") + ".docx";
+    fname = reportFileName();
     st("✔ تم! الملف جاهز", "var(--ok)");
     $("out").style.display = "flex";
   }catch(e){ st("✖ " + e.message, "var(--err)"); }
   $("go").disabled = false; $("bar").style.display = "none";
 };
-$("dl").onclick = () => {
-  const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = fname; a.click();
+$("dl").onclick = async () => {
+  if(!blob) return;
+  fname = reportFileName();
+  try {
+    const dir = await getReportDirectory();
+    if(dir){
+      const handle = await dir.getFileHandle(fname,{create:true});
+      const writable = await handle.createWritable();
+      await writable.write(blob);
+      await writable.close();
+      st(`✔ اتحفظ التقرير داخل ${FOLDER_NAME}/${fname}`,"var(--ok)");
+      return;
+    }
+  } catch(e) {
+    if(e.name === "AbortError") return;
+    console.warn("Folder save unavailable; using normal download.",e);
+  }
+  const a = document.createElement("a");
+  const url = URL.createObjectURL(blob);
+  a.href = url; a.download = fname; a.click();
+  setTimeout(()=>URL.revokeObjectURL(url),1500);
+  st("تم تنزيل التقرير. لو اختيار المجلد غير مدعوم، انقله يدوياً إلى SB In Body.","var(--ok)");
 };
 $("share").onclick = async () => {
   const f = new File([blob], fname, {type: blob.type});
